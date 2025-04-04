@@ -2,5 +2,30 @@
 name = "sweet-magnet"
 version = "0.1.0"
 edition = "2024"
+authors = ["Clément Malige <clement.maligeoff@gmail.com>"]
+description = "A secure and fast magnet link streaming player"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/malclement/sweet-magnet.git"
 
 [dependencies]
+# Core functionality
+tokio = { version = "1.28", features = ["full"] } # Async runtime
+clap = { version = "4.3", features = ["derive"] } # Command line argument parsing
+anyhow = "1.0"    # Error handling
+log = "0.4"       # Logging
+env_logger = "0.11.8" # Logger implementation
+serde = { version = "1.0", features = ["derive"] } # Serialization
+serde_json = "1.0" # JSON handling
+
+url = "2.4"       # For parsing magnet URLs
+sha-1 = "0.10"    # For hash calculations
+hex = "0.4"       # For hex encoding/decoding
+reqwest = { version = "0.12.15", features = ["json"] } # HTTP client
+
+# For BitTorrent protocol
+serde_bencode = "0.2.3"
+
+[dev-dependencies]
+tempfile = "3.6"  # For tests
+mockall = "0.13.1"  # For mocking in tests

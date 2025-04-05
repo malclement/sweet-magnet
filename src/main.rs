@@ -1,41 +1,67 @@
 use anyhow::{Context, Result};
-use clap::Parser;
-use log::{info, warn, error};
+use env_logger::Env;
+use log::{debug, error, info, warn};
 
-/// Command line arguments
-#[derive(Parser, Debug)]
-#[clap(author, version, about)]
-struct Args {
-    /// Magnet link to stream
-    #[clap(short, long)]
-    magnet: String,
+mod config;
+mod error;
+mod torrent;
+mod ui;
 
-    /// Output directory for downloaded content
-    #[clap(short, long, default_value = "./temp")]
-    output_dir: String,
+use error::SweetMagnetError;
+use torrent::{MagnetLink, TorrentClient};
+use ui::Cli;
 
-    /// Verbose output
-    #[clap(short, long)]
-    verbose: bool,
-}
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize CLI and parse arguments
+    let cli = Cli::new().context("Failed to initialize CLI")?;
 
-fn main() -> Result<()> {
-    // Parse command line arguments
-    let args = Args::parse();
+    // Initialize logging
+    initialize_logging(cli.args.verbose);
 
-    // Initialize logger
-    if args.verbose {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    } else {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    info!("Starting SweetMagnet version {}", env!("CARGO_PKG_VERSION"));
+    debug!("Using config: {:?}", cli.config);
+
+    // Parse the magnet link
+    let magnet_link = match MagnetLink::parse(&cli.args.magnet) {
+        Ok(link) => link,
+        Err(e) => {
+            error!("Failed to parse magnet link: {}", e);
+            return Err(anyhow::anyhow!(e));
+        }
+    };
+
+    info!("Parsed magnet link: {}", magnet_link.name());
+    debug!("Magnet info hash: {}", magnet_link.info_hash());
+    debug!("Found {} trackers", magnet_link.trackers.len());
+
+    // Create and initialize the torrent client
+    let client = TorrentClient::new(magnet_link, &cli.config.download_dir);
+    client.initialize().await.context("Failed to initialize torrent client")?;
+
+    // Start downloading
+    match client.download().await {
+        Ok(file_path) => {
+            info!("Successfully downloaded to: {}", file_path);
+        }
+        Err(e) => {
+            error!("Download failed: {}", e);
+            return Err(anyhow::anyhow!(e));
+        }
     }
 
-    info!("Starting SweetMagnet...");
-    info!("Magnet link: {}", args.magnet);
-
-    // TODO: Initialize the torrent client
-
-    // TODO: Start downloading and streaming the content
-
+    info!("Download completed successfully!");
     Ok(())
+}
+
+fn initialize_logging(verbose: bool) {
+    let env = if verbose {
+        Env::default().default_filter_or("debug")
+    } else {
+        Env::default().default_filter_or("info")
+    };
+
+    env_logger::Builder::from_env(env)
+        .format_timestamp_secs()
+        .init();
 }

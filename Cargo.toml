@@ -22,10 +22,12 @@ url = "2.4"       # For parsing magnet URLs
 sha-1 = "0.10"    # For hash calculations
 hex = "0.4"       # For hex encoding/decoding
 reqwest = { version = "0.12.15", features = ["json"] } # HTTP client
-rand = "0.8"      # For generating random values
+rand = "0.9.0"      # For generating random values
 
 # For BitTorrent protocol
 serde_bencode = "0.2.3"
+bytes = "1.10.1"
+chrono = "0.4.40"
 
 [dev-dependencies]
 tempfile = "3.6"  # For tests

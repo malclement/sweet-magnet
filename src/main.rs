@@ -1,9 +1,11 @@
+// src/main.rs
 use anyhow::{Context, Result};
 use env_logger::Env;
 use log::{debug, error, info, warn};
 
 mod config;
 mod error;
+mod protocol;
 mod torrent;
 mod ui;
 
@@ -36,16 +38,21 @@ async fn main() -> Result<()> {
     debug!("Found {} trackers", magnet_link.trackers.len());
 
     // Create and initialize the torrent client
-    let client = TorrentClient::new(magnet_link, &cli.config.download_dir);
+    let mut client = TorrentClient::new(magnet_link, &cli.config.download_dir);
     client.initialize().await.context("Failed to initialize torrent client")?;
+
+    // Print initial message
+    println!("\nStarting download... Press Ctrl+C to cancel\n");
 
     // Start downloading
     match client.download().await {
         Ok(file_path) => {
             info!("Successfully downloaded to: {}", file_path);
+            println!("\nDownload completed: {}\n", file_path);
         }
         Err(e) => {
             error!("Download failed: {}", e);
+            println!("\nDownload failed: {}\n", e);
             return Err(anyhow::anyhow!(e));
         }
     }

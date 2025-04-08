@@ -5,16 +5,20 @@ use log::{debug, info, warn, error};
 use serde::{Deserialize, Serialize};
 use serde_bencode::value::Value;
 use sha1::{Digest, Sha1};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::net::SocketAddr;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{timeout, Duration};
 use tokio::net::TcpStream;
 use std::io::Cursor;
+use std::sync::Arc;
+use std::time::Instant;
 use rand::Rng;
+use url::Url;
+use crate::protocol::{Dht, Tracker, TrackerEvent, UdpTracker};
 
 /// A file in the torrent
 #[derive(Debug, Clone)]
@@ -220,12 +224,13 @@ impl TorrentMetadata {
     }
 
     /// Create metadata from a magnet link (fetches metadata from peers)
-    pub async fn from_magnet(info_hash: [u8; 20], name: &str) -> Result<Self> {
+    pub async fn from_magnet(info_hash: [u8; 20], name: &str, trackers: &[String]) -> Result<Self> {
         // Constants for metadata exchange
         const METADATA_PIECE_SIZE: usize = 16384; // 16 KiB
         const MAX_METADATA_SIZE: usize = 10 * 1024 * 1024; // 10 MiB
         const METADATA_FETCH_TIMEOUT: u64 = 60; // 60 seconds
-        const MAX_PEERS: usize = 10;
+        const MAX_PEERS: usize = 50;
+        const MAX_CONCURRENT_CONNECTIONS: usize = 10;
 
         info!("Fetching metadata for magnet link with info hash: {:?}", info_hash);
 
@@ -234,233 +239,283 @@ impl TorrentMetadata {
         let mut rng = rand::thread_rng();
         rng.fill(&mut peer_id[..]);
 
-        // In a real implementation, we would fetch peers from trackers or DHT
-        // For this implementation, we'll connect to a predefined list of peers for the demo
-        // This would be provided from the magnet link's trackers in the real world
+        // Create a channel for collecting peers from different sources
+        let (peer_tx, mut peer_rx) = mpsc::channel(100);
+        let all_peers = Arc::new(Mutex::new(HashSet::new()));
 
-        // Function to connect to a single peer and fetch metadata
-        async fn fetch_from_peer(
-            peer_addr: SocketAddr,
-            info_hash: [u8; 20],
-            peer_id: [u8; 20]
-        ) -> Result<BytesMut> {
-            debug!("Connecting to peer {} for metadata", peer_addr);
+        // Start tasks to fetch peers from trackers and DHT in parallel
 
-            // Connect to peer with timeout
-            let stream = timeout(
-                Duration::from_secs(30),
-                TcpStream::connect(peer_addr)
-            ).await??;
+        // 1. Fetch peers from HTTP trackers
+        let http_trackers: Vec<_> = trackers.iter()
+            .filter(|t| t.starts_with("http"))
+            .cloned()
+            .collect();
 
-            let (mut reader, mut writer) = stream.into_split();
+        if !http_trackers.is_empty() {
+            let info_hash_clone = info_hash;
+            let peer_id_clone = peer_id;
+            let peer_tx_clone = peer_tx.clone();
+            let all_peers_clone = all_peers.clone();
 
-            // Send handshake with extension protocol support
-            let mut handshake = BytesMut::with_capacity(68);
-            handshake.put_u8(19);
-            handshake.put_slice(b"BitTorrent protocol");
+            tokio::spawn(async move {
+                info!("Fetching peers from {} HTTP trackers", http_trackers.len());
 
-            // Enable extension protocol in reserved bytes
-            let mut reserved = [0u8; 8];
-            reserved[5] |= 0x10;  // Extension protocol flag
-            handshake.put_slice(&reserved);
+                for tracker_url in http_trackers {
+                    match Url::parse(&tracker_url) {
+                        Ok(_) => {
+                            let tracker = Tracker::new(
+                                &tracker_url,
+                                info_hash_clone,
+                                peer_id_clone,
+                                0, // We don't know the size yet
+                            );
 
-            handshake.put_slice(&info_hash);
-            handshake.put_slice(&peer_id);
-            writer.write_all(&handshake).await?;
+                            match tracker.announce(TrackerEvent::Started).await {
+                                Ok(response) => {
+                                    info!("Got {} peers from HTTP tracker: {}", response.peers.len(), tracker_url);
 
-            // Read handshake response
-            let mut response = [0u8; 68];
-            reader.read_exact(&mut response).await?;
+                                    // Add peers to the set and send to channel
+                                    let new_peers = {
+                                        let mut all_peers = all_peers_clone.lock().await;
+                                        let mut new_count = 0;
 
-            // Verify handshake
-            if response[0] != 19 || &response[1..20] != b"BitTorrent protocol" {
-                return Err(anyhow::anyhow!("Invalid handshake response"));
-            }
-
-            // Check if extension protocol is supported
-            if (response[25] & 0x10) == 0 {
-                return Err(anyhow::anyhow!("Peer doesn't support extension protocol"));
-            }
-
-            // Send extension handshake
-            let extension_data = serde_json::json!({
-                "m": {
-                    "ut_metadata": 1
-                },
-                "v": "SweetMagnet/1.0",
-                "metadata_size": 0
-            });
-
-            let ext_data = serde_json::to_vec(&extension_data)?;
-            let mut ext_msg = BytesMut::with_capacity(ext_data.len() + 6);
-            ext_msg.put_u32((ext_data.len() as u32) + 2);
-            ext_msg.put_u8(20); // Extension message ID
-            ext_msg.put_u8(0);  // Handshake ID
-            ext_msg.put_slice(&ext_data);
-            writer.write_all(&ext_msg).await?;
-
-            // Process messages to get metadata
-            let mut metadata_size = 0;
-            let mut ut_metadata_id = 0;
-            let mut pieces = HashMap::new();
-            let mut num_pieces = 0;
-
-            // Main message processing loop
-            loop {
-                // Read message length
-                let mut len_buf = [0u8; 4];
-                reader.read_exact(&mut len_buf).await?;
-                let msg_len = u32::from_be_bytes(len_buf);
-
-                if msg_len == 0 {
-                    // Keep-alive message, ignore
-                    continue;
-                }
-
-                // Read message ID
-                let mut id_buf = [0u8; 1];
-                reader.read_exact(&mut id_buf).await?;
-                let msg_id = id_buf[0];
-
-                if msg_id == 20 { // Extension message
-                    // Read extension ID
-                    let mut ext_id_buf = [0u8; 1];
-                    reader.read_exact(&mut ext_id_buf).await?;
-                    let ext_id = ext_id_buf[0];
-
-                    // Read rest of the message
-                    let payload_len = msg_len as usize - 2;
-                    let mut data = vec![0u8; payload_len];
-                    reader.read_exact(&mut data).await?;
-
-                    if ext_id == 0 { // Extension handshake
-                        if let Ok(response) = serde_json::from_slice::<serde_json::Value>(&data) {
-                            // Extract metadata size
-                            if let Some(size) = response.get("metadata_size").and_then(|v| v.as_u64()) {
-                                metadata_size = size as usize;
-                                num_pieces = (metadata_size + METADATA_PIECE_SIZE - 1) / METADATA_PIECE_SIZE; // Ceiling division
-                                debug!("Metadata size: {} bytes, {} pieces", metadata_size, num_pieces);
-                            }
-
-                            // Extract ut_metadata extension ID
-                            if let Some(m) = response.get("m").and_then(|v| v.as_object()) {
-                                if let Some(id) = m.get("ut_metadata").and_then(|v| v.as_u64()) {
-                                    ut_metadata_id = id as u8;
-                                    debug!("ut_metadata extension ID: {}", ut_metadata_id);
-
-                                    // Request all metadata pieces
-                                    for piece in 0..num_pieces {
-                                        let request = serde_json::json!({
-                                            "msg_type": 0, // request
-                                            "piece": piece
-                                        });
-
-                                        let req_data = serde_json::to_vec(&request)?;
-                                        let mut req_msg = BytesMut::with_capacity(req_data.len() + 6);
-                                        req_msg.put_u32((req_data.len() as u32) + 2);
-                                        req_msg.put_u8(20); // Extension message ID
-                                        req_msg.put_u8(ut_metadata_id); // ut_metadata ID
-                                        req_msg.put_slice(&req_data);
-                                        writer.write_all(&req_msg).await?;
-                                    }
-                                }
-                            }
-                        }
-                    } else if ext_id == ut_metadata_id {
-                        // Process metadata piece message
-                        // Find the bencoded dictionary at the beginning
-                        let mut dict_end = 0;
-                        for i in 0..data.len().min(100) { // Look in first 100 bytes
-                            if data[i] == b'e' && i + 1 < data.len() &&
-                                (data[i+1] == b'0' || data[i+1] == b'1' || data[i+1] == b'2') {
-                                dict_end = i + 1;
-                                break;
-                            }
-                        }
-
-                        if dict_end > 0 {
-                            if let Ok(piece_info) = serde_json::from_slice::<serde_json::Value>(&data[..dict_end]) {
-                                // Check message type
-                                if let Some(msg_type) = piece_info.get("msg_type").and_then(|v| v.as_u64()) {
-                                    if msg_type == 1 { // Data
-                                        if let Some(piece) = piece_info.get("piece").and_then(|v| v.as_u64()) {
-                                            let piece_index = piece as usize;
-                                            let piece_data = Bytes::copy_from_slice(&data[dict_end..]);
-
-                                            // Save the piece
-                                            pieces.insert(piece_index, piece_data);
-                                            debug!("Received metadata piece {}/{}", piece_index + 1, num_pieces);
-
-                                            // Check if we have all pieces
-                                            if pieces.len() == num_pieces {
-                                                // Combine all pieces
-                                                let mut complete_metadata = BytesMut::with_capacity(metadata_size);
-                                                for i in 0..num_pieces {
-                                                    if let Some(piece_data) = pieces.get(&i) {
-                                                        complete_metadata.extend_from_slice(piece_data);
-                                                    }
+                                        for peer_addr in response.peers {
+                                            if all_peers.insert(peer_addr) {
+                                                new_count += 1;
+                                                if let Err(e) = peer_tx_clone.send(peer_addr).await {
+                                                    error!("Failed to send peer to channel: {}", e);
+                                                    break;
                                                 }
-
-                                                // Truncate to the correct size (last piece might be padded)
-                                                if complete_metadata.len() > metadata_size {
-                                                    complete_metadata.truncate(metadata_size);
-                                                }
-
-                                                return Ok(complete_metadata);
                                             }
                                         }
-                                    } else if msg_type == 2 { // Reject
-                                        warn!("Peer rejected metadata request");
-                                    }
+
+                                        new_count
+                                    };
+
+                                    debug!("Added {} new unique peers from HTTP tracker", new_peers);
+                                },
+                                Err(e) => {
+                                    warn!("Failed to get peers from HTTP tracker {}: {}", tracker_url, e);
                                 }
                             }
+                        },
+                        Err(e) => {
+                            warn!("Invalid tracker URL {}: {}", tracker_url, e);
                         }
                     }
                 }
+            });
+        }
+
+        // 2. Fetch peers from UDP trackers
+        let udp_trackers: Vec<_> = trackers.iter()
+            .filter(|t| t.starts_with("udp"))
+            .cloned()
+            .collect();
+
+        if !udp_trackers.is_empty() {
+            let info_hash_clone = info_hash;
+            let peer_id_clone = peer_id;
+            let peer_tx_clone = peer_tx.clone();
+            let all_peers_clone = all_peers.clone();
+
+            tokio::spawn(async move {
+                info!("Fetching peers from {} UDP trackers", udp_trackers.len());
+
+                for tracker_url in udp_trackers {
+                    match UdpTracker::new(&tracker_url).await {
+                        Ok(mut tracker) => {
+                            match tracker.announce(
+                                info_hash_clone,
+                                peer_id_clone,
+                                0, // downloaded
+                                0, // left (unknown)
+                                0, // uploaded
+                                2, // event: started
+                                6881, // port
+                            ).await {
+                                Ok(peers) => {
+                                    info!("Got {} peers from UDP tracker: {}", peers.len(), tracker_url);
+
+                                    // Add peers to the set and send to channel
+                                    let new_peers = {
+                                        let mut all_peers = all_peers_clone.lock().await;
+                                        let mut new_count = 0;
+
+                                        for peer_addr in peers {
+                                            if all_peers.insert(peer_addr) {
+                                                new_count += 1;
+                                                if let Err(e) = peer_tx_clone.send(peer_addr).await {
+                                                    error!("Failed to send peer to channel: {}", e);
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        new_count
+                                    };
+
+                                    debug!("Added {} new unique peers from UDP tracker", new_peers);
+                                },
+                                Err(e) => {
+                                    warn!("Failed to get peers from UDP tracker {}: {}", tracker_url, e);
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            warn!("Failed to initialize UDP tracker {}: {}", tracker_url, e);
+                        }
+                    }
+                }
+            });
+        }
+
+        // 3. Fetch peers from DHT
+        let dht_enabled = true; // Could be a config option
+
+        if dht_enabled {
+            let info_hash_clone = info_hash;
+            let peer_tx_clone = peer_tx.clone();
+            let all_peers_clone = all_peers.clone();
+
+            tokio::spawn(async move {
+                info!("Fetching peers from DHT");
+
+                match Dht::new().await {
+                    Ok(mut dht) => {
+                        match dht.find_peers(info_hash_clone, 30).await {
+                            Ok(peers) => {
+                                info!("Got {} peers from DHT", peers.len());
+
+                                // Add peers to the set and send to channel
+                                let new_peers = {
+                                    let mut all_peers = all_peers_clone.lock().await;
+                                    let mut new_count = 0;
+
+                                    for peer_addr in peers {
+                                        if all_peers.insert(peer_addr) {
+                                            new_count += 1;
+                                            if let Err(e) = peer_tx_clone.send(peer_addr).await {
+                                                error!("Failed to send peer to channel: {}", e);
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    new_count
+                                };
+
+                                debug!("Added {} new unique peers from DHT", new_peers);
+                            },
+                            Err(e) => {
+                                warn!("Failed to get peers from DHT: {}", e);
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to initialize DHT: {}", e);
+                    }
+                }
+            });
+        }
+
+        // Drop the original sender so the channel can close when all tasks are done
+        drop(peer_tx);
+
+        // Wait for some initial peers (with timeout)
+        let start_time = Instant::now();
+        let peer_discovery_timeout = Duration::from_secs(10);
+        let mut peers = Vec::new();
+
+        // Collect peers until we have enough or timeout
+        while let Ok(Some(peer)) = timeout(
+            peer_discovery_timeout.saturating_sub(start_time.elapsed()),
+            peer_rx.recv()
+        ).await {
+            peers.push(peer);
+
+            // If we have enough peers, break
+            if peers.len() >= MAX_PEERS {
+                break;
+            }
+
+            // Check timeout
+            if start_time.elapsed() >= peer_discovery_timeout {
+                break;
             }
         }
 
-        // In a real implementation, we would get peers from trackers or DHT
-        // For now, we'll create a simulated list of peers for demonstration
-        let peers = Vec::<SocketAddr>::new(); // This would be populated from trackers
+        // Continue collecting peers in the background
+        let (extra_peers_tx, mut extra_peers_rx) = mpsc::channel(100);
+        tokio::spawn(async move {
+            while let Some(peer) = peer_rx.recv().await {
+                if let Err(_) = extra_peers_tx.send(peer).await {
+                    break;
+                }
+            }
+        });
 
         if peers.is_empty() {
             return Err(anyhow::anyhow!("No peers available to fetch metadata"));
         }
 
-        // Try to fetch from multiple peers concurrently
+        info!("Found {} peers for metadata exchange", peers.len());
+
+        // Create a channel for receiving metadata
+        let (metadata_tx, mut metadata_rx) = mpsc::channel(1);
+        let mut active_tasks = 0;
+        let max_tasks = MAX_CONCURRENT_CONNECTIONS;
+
+        // Try to fetch metadata from peers concurrently (with limits)
         let metadata_result = timeout(
             Duration::from_secs(METADATA_FETCH_TIMEOUT),
             async {
-                let mut tasks = Vec::new();
+                let mut peer_index = 0;
 
-                // Start concurrent tasks for each peer (limit to MAX_PEERS)
-                for &peer_addr in peers.iter().take(MAX_PEERS) {
-                    let info_hash_clone = info_hash;
-                    let peer_id_clone = peer_id;
+                // Process peers until we get metadata or run out of peers
+                loop {
+                    // Start new tasks if we have peers and are under the limit
+                    while active_tasks < max_tasks && peer_index < peers.len() {
+                        let peer_addr = peers[peer_index];
+                        peer_index += 1;
 
-                    let task = tokio::spawn(async move {
-                        match fetch_from_peer(peer_addr, info_hash_clone, peer_id_clone).await {
-                            Ok(metadata) => Some(metadata),
-                            Err(e) => {
-                                debug!("Failed to fetch metadata from {}: {}", peer_addr, e);
-                                None
+                        let info_hash_clone = info_hash;
+                        let peer_id_clone = peer_id;
+                        let metadata_tx_clone = metadata_tx.clone();
+
+                        active_tasks += 1;
+                        tokio::spawn(async move {
+                            match fetch_from_peer(peer_addr, info_hash_clone, peer_id_clone).await {
+                                Ok(metadata) => {
+                                    if let Err(_) = metadata_tx_clone.send(metadata).await {
+                                        // Channel is closed, receiver got metadata already
+                                    }
+                                },
+                                Err(e) => {
+                                    debug!("Failed to fetch metadata from {}: {}", peer_addr, e);
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
 
-                    tasks.push(task);
-                }
-
-                // Wait for the first successful result
-                for task in tasks {
-                    if let Ok(Some(metadata)) = task.await {
-                        // We got the metadata from one peer, abort other tasks
+                    // Check if we received metadata
+                    if let Ok(metadata) = metadata_rx.try_recv() {
                         return Ok(metadata);
                     }
-                }
 
-                Err(anyhow::anyhow!("Failed to fetch metadata from any peer"))
+                    // Try to get more peers if available
+                    if peer_index >= peers.len() {
+                        if let Ok(peer) = extra_peers_rx.try_recv() {
+                            peers.push(peer);
+                        } else if active_tasks == 0 {
+                            // No more peers and no active tasks
+                            return Err(anyhow::anyhow!("Failed to fetch metadata from any peer"));
+                        }
+                    }
+
+                    // Wait a bit to avoid spinning
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
         ).await;
 
@@ -547,4 +602,334 @@ fn parse_metadata(metadata_bytes: &BytesMut, info_hash: [u8; 20], name: &str) ->
         files,
         is_single_file,
     })
+}
+
+/// Fetch metadata from a peer using extension protocol
+async fn fetch_from_peer(
+    peer_addr: SocketAddr,
+    info_hash: [u8; 20],
+    peer_id: [u8; 20],
+) -> Result<BytesMut> {
+    // Constants for the protocol
+    const BT_PROTOCOL: &[u8] = b"BitTorrent protocol";
+    const EXTENSION_BIT: u8 = 0x10; // Extended messaging protocol bit (5th byte)
+    const HANDSHAKE_SIZE: usize = 68; // 1 + 19 + 8 + 20 + 20
+    const EXT_HANDSHAKE_ID: u8 = 0;
+
+    // ut_metadata message types
+    const REQUEST: u8 = 0;
+    const DATA: u8 = 1;
+    const REJECT: u8 = 2;
+
+    const METADATA_PIECE_SIZE: usize = 16384; // 16 KiB
+    const MAX_METADATA_SIZE: usize = 10 * 1024 * 1024; // 10 MiB
+
+    debug!("Connecting to peer at {}", peer_addr);
+
+    // Connect to the peer with timeout
+    let mut stream = match timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(peer_addr),
+    ).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => return Err(anyhow::anyhow!("Failed to connect to peer: {}", e)),
+        Err(_) => return Err(anyhow::anyhow!("Connection to peer timed out")),
+    };
+
+    debug!("Connected to peer at {}", peer_addr);
+
+    // Prepare the handshake
+    let mut handshake = BytesMut::with_capacity(HANDSHAKE_SIZE);
+
+    // Protocol name length
+    handshake.put_u8(BT_PROTOCOL.len() as u8);
+    // Protocol name
+    handshake.put_slice(BT_PROTOCOL);
+
+    // Reserved bytes - set the extension protocol bit
+    let mut reserved = [0u8; 8];
+    reserved[5] |= EXTENSION_BIT; // Enable extended messaging protocol
+    handshake.put_slice(&reserved);
+
+    // Info hash and peer ID
+    handshake.put_slice(&info_hash);
+    handshake.put_slice(&peer_id);
+
+    // Send handshake
+    if let Err(e) = stream.write_all(&handshake).await {
+        return Err(anyhow::anyhow!("Failed to send handshake: {}", e));
+    }
+
+    // Receive handshake response
+    let mut response = BytesMut::with_capacity(HANDSHAKE_SIZE);
+    response.resize(HANDSHAKE_SIZE, 0);
+
+    if let Err(e) = timeout(Duration::from_secs(5), stream.read_exact(&mut response)).await {
+        return Err(anyhow::anyhow!("Handshake response timed out: {}", e));
+    }
+
+    // Check if extended messaging protocol is supported
+    if response[25] & EXTENSION_BIT == 0 {
+        return Err(anyhow::anyhow!("Peer does not support extended messaging protocol"));
+    }
+
+    // Check info hash in response
+    let response_info_hash = &response[28..48];
+    if response_info_hash != info_hash {
+        return Err(anyhow::anyhow!("Info hash mismatch in handshake response"));
+    }
+
+    debug!("Handshake with peer at {} successful", peer_addr);
+
+    // Send extended handshake
+    let mut ext_handshake = HashMap::new();
+    let mut m = HashMap::new();
+    // Use byte vectors for keys instead of strings
+    m.insert(b"ut_metadata".to_vec(), Value::Int(1)); // Ask for ut_metadata extension
+    ext_handshake.insert(b"m".to_vec(), Value::Dict(m));
+    ext_handshake.insert(b"metadata_size".to_vec(), Value::Int(0)); // We don't know the size yet
+
+    let ext_handshake_encoded = serde_bencode::to_bytes(&ext_handshake)
+        .context("Failed to encode extended handshake")?;
+
+    // Send extended handshake message
+    // Format: <length prefix><message ID = 20><extended message ID = 0><payload>
+    let mut message = BytesMut::new();
+    message.put_u32(1 + 1 + ext_handshake_encoded.len() as u32); // length prefix
+    message.put_u8(20); // extended message ID
+    message.put_u8(EXT_HANDSHAKE_ID); // extended handshake ID
+    message.put_slice(&ext_handshake_encoded);
+
+    if let Err(e) = stream.write_all(&message).await {
+        return Err(anyhow::anyhow!("Failed to send extended handshake: {}", e));
+    }
+
+    debug!("Sent extended handshake to peer at {}", peer_addr);
+
+    // Process messages and fetch metadata
+    let mut metadata_size = 0;
+    let mut ut_metadata_id = 0;
+    let mut metadata_pieces = HashMap::new();
+    let mut metadata = None;
+
+    // Set a timeout for the entire metadata fetch operation
+    let start_time = Instant::now();
+    let timeout_duration = Duration::from_secs(30);
+
+    while start_time.elapsed() < timeout_duration {
+        // Read message length
+        let mut len_buf = [0u8; 4];
+        match timeout(Duration::from_secs(5), stream.read_exact(&mut len_buf)).await {
+            Ok(Ok(_)) => {},
+            Ok(Err(e)) => return Err(anyhow::anyhow!("Failed to read message length: {}", e)),
+            Err(_) => return Err(anyhow::anyhow!("Read message timed out")),
+        }
+
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len == 0 {
+            // Keep-alive message, ignore
+            continue;
+        }
+
+        // Read message ID
+        let mut id_buf = [0u8; 1];
+        if let Err(e) = stream.read_exact(&mut id_buf).await {
+            return Err(anyhow::anyhow!("Failed to read message ID: {}", e));
+        }
+
+        let id = id_buf[0];
+
+        // Handle extended message
+        if id == 20 {
+            // Read extended message ID
+            let mut ext_id_buf = [0u8; 1];
+            if let Err(e) = stream.read_exact(&mut ext_id_buf).await {
+                return Err(anyhow::anyhow!("Failed to read extended message ID: {}", e));
+            }
+
+            let ext_id = ext_id_buf[0];
+
+            // Read payload
+            let payload_len = len - 2; // Subtract message ID and extended ID
+            let mut payload = BytesMut::with_capacity(payload_len);
+            payload.resize(payload_len, 0);
+
+            if let Err(e) = stream.read_exact(&mut payload).await {
+                return Err(anyhow::anyhow!("Failed to read extended message payload: {}", e));
+            }
+
+            // Handle extended handshake
+            if ext_id == EXT_HANDSHAKE_ID {
+                let ext_handshake: HashMap<Vec<u8>, Value> = match serde_bencode::from_bytes(&payload) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        debug!("Failed to parse extended handshake: {}", e);
+                        continue;
+                    }
+                };
+
+                // Get metadata size
+                if let Some(Value::Int(size)) = ext_handshake.get(b"metadata_size".as_slice()) {
+                    metadata_size = *size as usize;
+                    debug!("Metadata size: {} bytes", metadata_size);
+
+                    if metadata_size == 0 || metadata_size > MAX_METADATA_SIZE {
+                        return Err(anyhow::anyhow!("Invalid metadata size: {}", metadata_size));
+                    }
+                }
+
+                // Get ut_metadata ID
+                if let Some(Value::Dict(m)) = ext_handshake.get(b"m".as_slice()) {
+                    if let Some(Value::Int(id)) = m.get(b"ut_metadata".as_slice()) {
+                        ut_metadata_id = *id as u8;
+                        debug!("ut_metadata ID: {}", ut_metadata_id);
+                    }
+                }
+
+                // If we have metadata size and ut_metadata ID, start requesting pieces
+                if metadata_size > 0 && ut_metadata_id > 0 {
+                    // Calculate number of pieces
+                    let num_pieces = (metadata_size + METADATA_PIECE_SIZE - 1) / METADATA_PIECE_SIZE;
+                    debug!("Requesting {} metadata pieces", num_pieces);
+
+                    // Request all pieces
+                    for piece in 0..num_pieces {
+                        let mut request = HashMap::new();
+                        request.insert(b"msg_type".to_vec(), Value::Int(REQUEST as i64));
+                        request.insert(b"piece".to_vec(), Value::Int(piece as i64));
+
+                        let request_encoded = serde_bencode::to_bytes(&request)
+                            .context("Failed to encode metadata request")?;
+
+                        // Send request message
+                        let mut message = BytesMut::new();
+                        message.put_u32(2 + request_encoded.len() as u32); // length prefix
+                        message.put_u8(20); // extended message ID
+                        message.put_u8(ut_metadata_id); // ut_metadata ID
+                        message.put_slice(&request_encoded);
+
+                        if let Err(e) = stream.write_all(&message).await {
+                            return Err(anyhow::anyhow!("Failed to send metadata request: {}", e));
+                        }
+                    }
+                }
+            }
+            // Handle ut_metadata message
+            else if ext_id == ut_metadata_id && metadata_size > 0 {
+                // Find the bencode dict at the start of the payload
+                let mut dict_end = 0;
+                for i in 0..payload.len() {
+                    if payload[i] == b'e' {
+                        // Check if we've found the end of the dictionary
+                        if let Ok(_) = serde_bencode::from_bytes::<HashMap<Vec<u8>, Value>>(&payload[0..i+1]) {
+                            dict_end = i + 1;
+                            break;
+                        }
+                    }
+                }
+
+                if dict_end == 0 {
+                    debug!("Failed to find bencode dict in ut_metadata message");
+                    continue;
+                }
+
+                // Parse the dict
+                let dict: HashMap<Vec<u8>, Value> = match serde_bencode::from_bytes(&payload[0..dict_end]) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        debug!("Failed to parse ut_metadata message: {}", e);
+                        continue;
+                    }
+                };
+
+                // Get message type
+                let msg_type = match dict.get(b"msg_type".as_slice()) {
+                    Some(Value::Int(t)) => *t as u8,
+                    _ => {
+                        debug!("Missing msg_type in ut_metadata message");
+                        continue;
+                    }
+                };
+
+                // Get piece index
+                let piece = match dict.get(b"piece".as_slice()) {
+                    Some(Value::Int(p)) => *p as usize,
+                    _ => {
+                        debug!("Missing piece in ut_metadata message");
+                        continue;
+                    }
+                };
+
+                match msg_type {
+                    DATA => {
+                        // Get the data (follows the bencoded dict)
+                        let data = BytesMut::from(&payload[dict_end..]);
+                        debug!("Received metadata piece {} ({} bytes)", piece, data.len());
+
+                        // Store the piece
+                        metadata_pieces.insert(piece, data);
+
+                        // Check if we have all pieces
+                        let num_pieces = (metadata_size + METADATA_PIECE_SIZE - 1) / METADATA_PIECE_SIZE;
+                        if metadata_pieces.len() == num_pieces {
+                            debug!("Received all metadata pieces");
+
+                            // Assemble the complete metadata
+                            let mut complete = BytesMut::with_capacity(metadata_size);
+                            for i in 0..num_pieces {
+                                if let Some(piece) = metadata_pieces.get(&i) {
+                                    complete.put_slice(piece);
+                                } else {
+                                    return Err(anyhow::anyhow!("Missing metadata piece {}", i));
+                                }
+                            }
+
+                            // Verify the info hash
+                            let mut hasher = Sha1::new();
+                            hasher.update(&complete);
+                            let result = hasher.finalize();
+
+                            let mut computed_hash = [0u8; 20];
+                            computed_hash.copy_from_slice(&result);
+
+                            if computed_hash != info_hash {
+                                return Err(anyhow::anyhow!("Metadata info hash mismatch"));
+                            }
+
+                            metadata = Some(complete);
+                            break;
+                        }
+                    },
+                    REJECT => {
+                        debug!("Peer rejected metadata piece {}", piece);
+                    },
+                    _ => {
+                        debug!("Unknown ut_metadata message type: {}", msg_type);
+                    }
+                }
+            }
+        }
+        // Handle other message types (we can ignore them for metadata fetch)
+        else {
+            // Skip the message
+            let payload_len = len - 1; // Subtract message ID
+            let mut payload = BytesMut::with_capacity(payload_len);
+            payload.resize(payload_len, 0);
+
+            if let Err(e) = stream.read_exact(&mut payload).await {
+                return Err(anyhow::anyhow!("Failed to read message payload: {}", e));
+            }
+        }
+
+        // Check if we have the metadata
+        if metadata.is_some() {
+            break;
+        }
+    }
+
+    // Return the metadata
+    match metadata {
+        Some(m) => Ok(m),
+        None => Err(anyhow::anyhow!("Failed to fetch metadata from peer")),
+    }
 }

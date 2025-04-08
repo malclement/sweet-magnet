@@ -10,7 +10,7 @@ repository = "https://github.com/malclement/sweet-magnet.git"
 
 [dependencies]
 # Core functionality
-tokio = { version = "1.28", features = ["full"] } # Async runtime
+tokio = { version = "1.44.2", features = ["full"] } # Async runtime
 clap = { version = "4.3", features = ["derive"] } # Command line argument parsing
 anyhow = "1.0"    # Error handling
 log = "0.4"       # Logging
